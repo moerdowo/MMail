@@ -326,22 +326,40 @@ enum MIME {
     }
 
     private static func quotedPrintableData(_ s: String, underscoreSpace: Bool) -> Data? {
+        // Operate on raw UTF-8 octets, NOT Characters. Swift treats "\r\n" as a
+        // single Character (extended grapheme cluster), so a char-based scan can
+        // never match `=` then `\r` then `\n` as separate units and silently
+        // leaves CRLF soft line breaks (`=\r\n`) undecoded — which is exactly how
+        // RFC-compliant email wraps quoted-printable. Quoted-printable is defined
+        // on octets anyway, so decode over bytes.
+        let bytes = Array(s.utf8)
         var out = [UInt8]()
-        let chars = Array(s)
+        out.reserveCapacity(bytes.count)
+        func hex(_ b: UInt8) -> UInt8? {
+            switch b {
+            case 0x30...0x39: return b - 0x30          // 0–9
+            case 0x41...0x46: return b - 0x41 + 10     // A–F
+            case 0x61...0x66: return b - 0x61 + 10     // a–f
+            default: return nil
+            }
+        }
         var i = 0
-        while i < chars.count {
-            let c = chars[i]
-            if c == "=" {
-                if i + 1 < chars.count && chars[i + 1] == "\n" { i += 2; continue }
-                if i + 2 < chars.count && chars[i + 1] == "\r" { i += 3; continue }
-                if i + 2 < chars.count, let byte = UInt8(String(chars[i + 1...i + 2]), radix: 16) {
-                    out.append(byte); i += 3; continue
+        while i < bytes.count {
+            let b = bytes[i]
+            if b == 0x3D {  // '='
+                // Soft line break: "=\r\n", "=\n", or a bare "=\r".
+                if i + 2 < bytes.count, bytes[i + 1] == 0x0D, bytes[i + 2] == 0x0A { i += 3; continue }
+                if i + 1 < bytes.count, bytes[i + 1] == 0x0A { i += 2; continue }
+                if i + 1 < bytes.count, bytes[i + 1] == 0x0D { i += 2; continue }
+                // "=XX" hex escape.
+                if i + 2 < bytes.count, let hi = hex(bytes[i + 1]), let lo = hex(bytes[i + 2]) {
+                    out.append(hi << 4 | lo); i += 3; continue
                 }
-                out.append(0x3D); i += 1
-            } else if c == "_" && underscoreSpace {
+                out.append(0x3D); i += 1   // stray '=' — keep literal
+            } else if b == 0x5F, underscoreSpace {  // '_'
                 out.append(0x20); i += 1
             } else {
-                out.append(contentsOf: Array(String(c).utf8)); i += 1
+                out.append(b); i += 1
             }
         }
         return Data(out)
