@@ -1183,6 +1183,7 @@ final class AppModel: ObservableObject {
                       preview: String(draft.body.replacingOccurrences(of: "\n", with: " ").prefix(140)),
                       body: draft.body, time: f.string(from: Date()), day: "today",
                       folder: "sent", bodyLoaded: true)
+        e.bodyComplete = true   // full composed body is inline → already complete
         e.fromEmail = config(for: account)?.email
         e.fromName = accountsById[account]?.name
         e.attachments = draft.attachments.map { AttachmentMeta(filename: $0.filename, mimeType: $0.mimeType, size: $0.data.count) }
@@ -2171,6 +2172,7 @@ final class AppModel: ObservableObject {
                 merged[i].body = old.body
                 merged[i].preview = old.preview
                 merged[i].bodyLoaded = true
+                merged[i].bodyComplete = old.bodyComplete
                 merged[i].attachments = old.attachments
                 merged[i].hasAttachment = old.hasAttachment
                 merged[i].bodyHTML = old.bodyHTML
@@ -2303,19 +2305,31 @@ final class AppModel: ObservableObject {
             guard let datas = try? await self.withTimeout(30, {
                 try await session.fetchMessageDatas(mailbox: box, uids: uids, byteLimit: 65_536)
             }) else { return }
-            var parsedByUID: [UInt32: (text: String, html: String?, atts: [AttachmentMeta], unsub: String?, cal: String?)] = [:]
+            var parsedByUID: [UInt32: (text: String, html: String?, atts: [AttachmentMeta], unsub: String?, cal: String?, complete: Bool)] = [:]
             for (uid, data) in datas {
                 let p = MIME.parse(data)
                 let metas = p.attachments.map { AttachmentMeta(filename: $0.filename, mimeType: $0.mimeType, size: $0.data.count) }
-                parsedByUID[uid] = (p.text, p.html, metas, p.listUnsubscribe, p.calendar)
+                // `data` is the raw reassembled IMAP bytes — the byte count the
+                // 64 KB cap is measured against. Complete only when the message
+                // fit strictly under the cap (else it may be truncated → the
+                // uncapped open fetch upgrades it).
+                let complete = BodyFetch.isComplete(returnedBytes: data.count, byteLimit: 65_536)
+                parsedByUID[uid] = (p.text, p.html, metas, p.listUnsubscribe, p.calendar, complete)
             }
             await MainActor.run {
                 for (uid, p) in parsedByUID {
+                    // Skip any message already fully loaded: if the user opened a
+                    // >64 KB message during this prefetch's network window, the
+                    // open path set the complete body + bodyComplete=true. Writing
+                    // this (possibly truncated) 64 KB preview over it would demote
+                    // a complete body and reintroduce the truncation bug.
                     guard let id = uidToId[uid],
-                          let i = self.emails.firstIndex(where: { $0.id == id }) else { continue }
+                          let i = self.emails.firstIndex(where: { $0.id == id }),
+                          self.emails[i].bodyComplete != true else { continue }
                     self.emails[i].body = p.text
                     self.emails[i].preview = String(p.text.replacingOccurrences(of: "\n", with: " ").prefix(140))
                     self.emails[i].bodyLoaded = true
+                    self.emails[i].bodyComplete = p.complete
                     self.emails[i].attachments = p.atts
                     self.emails[i].hasAttachment = !p.atts.isEmpty
                     self.emails[i].unsubscribe = p.unsub
@@ -2363,7 +2377,9 @@ final class AppModel: ObservableObject {
     private var bodyLoadInFlight: Set<String> = []
 
     func loadBodyIfNeeded() {
-        guard let e = selectedEmail, isRealAccount(e.account), !e.bodyLoaded, let uid = e.uid,
+        guard let e = selectedEmail, isRealAccount(e.account),
+              BodyFetch.needsFullFetch(bodyLoaded: e.bodyLoaded, bodyComplete: e.bodyComplete),
+              let uid = e.uid,
               let session = bodySession(for: e.account) else { return }
         // Don't auto-retry if a previous attempt failed — wait for the user to
         // tap Retry. Also dedupe in-flight loads for the same email.
@@ -2387,8 +2403,11 @@ final class AppModel: ObservableObject {
 
         Task {
             do {
+                // Uncapped: the open fetch is the completeness source of truth —
+                // it retrieves the WHOLE message so a >64 KB body is never left
+                // truncated. The 30s timeout still bounds the read.
                 let data = try await self.withTimeout(30) {
-                    try await session.fetchMessageData(mailbox: box, uid: uid, byteLimit: 262_144)
+                    try await session.fetchMessageData(mailbox: box, uid: uid, byteLimit: nil)
                 }
                 let parsed = MIME.parse(data)
                 let metas = parsed.attachments.map { AttachmentMeta(filename: $0.filename, mimeType: $0.mimeType, size: $0.data.count) }
@@ -2399,6 +2418,7 @@ final class AppModel: ObservableObject {
                         self.emails[i].body = parsed.text
                         self.emails[i].preview = String(parsed.text.replacingOccurrences(of: "\n", with: " ").prefix(140))
                         self.emails[i].bodyLoaded = true
+                        self.emails[i].bodyComplete = true
                         self.emails[i].attachments = metas
                         self.emails[i].hasAttachment = !metas.isEmpty
                         self.emails[i].unsubscribe = parsed.listUnsubscribe
@@ -2408,6 +2428,7 @@ final class AppModel: ObservableObject {
                     if let j = self.serverSearchResults?.firstIndex(where: { $0.id == id }) {
                         self.serverSearchResults?[j].body = parsed.text
                         self.serverSearchResults?[j].bodyLoaded = true
+                        self.serverSearchResults?[j].bodyComplete = true
                         self.serverSearchResults?[j].attachments = metas
                     }
                     MailCache.save(self.emails.filter { $0.account == acct && $0.folder == fld },
